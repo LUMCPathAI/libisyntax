@@ -372,8 +372,6 @@ isyntax_error_t libisyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* isynta
     return LIBISYNTAX_OK;
 }
 
-#define PER_LEVEL_PADDING 3
-
 isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyntax_cache, int32_t level,
                                        int64_t x, int64_t y, int64_t width, int64_t height, uint32_t* pixels_buffer,
                                        int32_t pixel_format) {
@@ -386,9 +384,12 @@ isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyn
     ASSERT(level < isyntax->images[0].level_count);
     isyntax_level_t* current_level = &isyntax->images[0].levels[level];
 
-    // TODO(pvalkema): check if this still needs adjustment
-    int32_t num_levels = isyntax->images[0].level_count;
-    int32_t offset = ((PER_LEVEL_PADDING << num_levels) - PER_LEVEL_PADDING) >> level;
+    // The pyramid is padded by `level0_padding` pixels on each side of level 0, and the tile grid of each level starts
+    // `origin_offset_in_pixels` (in level 0 pixels) into that padding. Rounding down to whole pixels of the level
+    // gives the same pixels as the Philips SDK at every level.
+    int32_t level0_padding = isyntax->images[0].level0_padding;
+    int32_t origin_offset = (level == 0) ? 0 : current_level->origin_offset_in_pixels;
+    int32_t offset = (level0_padding - origin_offset) >> level;
 
     x += offset;
     y += offset;
