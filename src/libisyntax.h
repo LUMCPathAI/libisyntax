@@ -97,6 +97,27 @@ float                  libisyntax_level_get_mpp_y(const isyntax_level_t* level);
 double                 libisyntax_level_get_downsample_factor(const isyntax_level_t* level);
 double                 libisyntax_level_get_origin_offset_in_pixels(const isyntax_level_t* level);
 
+//== Valid data API ==
+// Coordinates are those of `libisyntax_read_region()`, which match the Philips SDK.
+
+// Range of pixels of a level the Philips SDK reports as valid for it (`DimensionRanges`), in pixels of the level,
+// bounds included. Level 0 is valid whole; each wavelet level halves the range of the level above and loses one more
+// pixel on each side.
+isyntax_error_t libisyntax_image_get_valid_range(const isyntax_image_t* image, int32_t level,
+                                                 int64_t* start_x, int64_t* start_y, int64_t* end_x, int64_t* end_y);
+// Box around the valid data envelopes of the WSI image, at level 0, clipped to the image. The whole image when the
+// file has no envelope.
+isyntax_error_t libisyntax_get_data_bounds(const isyntax_t* isyntax, int64_t* x, int64_t* y,
+                                           int64_t* width, int64_t* height);
+// Rectangles of the valid data envelopes of the WSI image at a level, as the Philips SDK reports them
+// (`envelopesAsRects`), in pixels of the level. iSyntax v2 headers list the envelopes as polygons; for v1 they are the
+// box around every group of connected level 0 tiles present in the file. At every level each envelope is eroded like
+// the valid range, then cut into vertical strips.
+// Writes at most `capacity` rectangles to `rects` as x, y, width, height (4 values each) and the number of rectangles
+// of the level to `count`, which may exceed `capacity`: call with `capacity` 0 to get it.
+isyntax_error_t libisyntax_get_data_envelopes(const isyntax_t* isyntax, int32_t level,
+                                              int64_t* rects, int32_t capacity, int32_t* count);
+
 //== Cache API ==
 isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t cache_size,
                                         isyntax_cache_t** out_isyntax_cache);

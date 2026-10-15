@@ -161,6 +161,12 @@ if(BUILD_TESTING)
             COMMAND ${CMAKE_COMMAND} -E compare_files ../test/expected_output/testslide_example_tile_3_5_10.png ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/output_smoke_example_runs_with_test_slide_producing_output.png)
     set_tests_properties(regression_example_tile_3_5_10_pixel_check PROPERTIES DEPENDS smoke_example_runs_with_test_slide_producing_output)
 
+    # Valid range, bounds and envelopes against the values of the Philips SDK.
+    add_executable(valid_data_test test/valid_data_test.c)
+    target_link_libraries(valid_data_test isyntax)
+    add_test(NAME valid_data_matches_philips_sdk
+            COMMAND valid_data_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax)
+
     if(NOT(APPLE))
         # TODO: fix this test on macOS: fatal error: 'threads.h' file not found
         add_executable(thread_test test/thread_test.c)

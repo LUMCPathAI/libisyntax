@@ -283,6 +283,302 @@ double libisyntax_level_get_origin_offset_in_pixels(const isyntax_level_t* level
     return level->origin_offset_in_pixels;
 }
 
+// == Valid data ==
+// An envelope is an orthogonal polygon, given by its vertex set. Pixels from the smallest x / y of the polygon are in
+// it, up to the largest excluded.
+
+#define ENVELOPE_MAX_VERTICES 64
+
+typedef struct envelope_edge_t {
+    i64 at;   // x of a vertical edge, y of a horizontal one
+    i64 from; // span on the other axis, end excluded
+    i64 to;
+} envelope_edge_t;
+
+typedef struct envelope_polygon_t {
+    i64 x[ENVELOPE_MAX_VERTICES];
+    i64 y[ENVELOPE_MAX_VERTICES];
+    i32 count;
+} envelope_polygon_t;
+
+static i64 floor_div2(i64 v) {
+    return v >= 0 ? v / 2 : -((-v + 1) / 2);
+}
+
+// First pixel of a range after `levels` wavelet levels.
+static i64 erode_start(i64 v, i32 levels) {
+    for (i32 i = 0; i < levels; ++i) v = -floor_div2(-v) + 1; // ceil(v / 2) + 1
+    return v;
+}
+
+// Last pixel (included) of a range after `levels` wavelet levels.
+static i64 erode_end(i64 v, i32 levels) {
+    for (i32 i = 0; i < levels; ++i) v = floor_div2(v) - 1;
+    return v;
+}
+
+static int compare_i64(const void* a, const void* b) {
+    i64 x = *(const i64*)a, y = *(const i64*)b;
+    return (x > y) - (x < y);
+}
+
+typedef struct envelope_vertex_t {
+    i64 line; // x for a vertical edge, y for a horizontal one
+    i64 pos;  // position on that line
+} envelope_vertex_t;
+
+static int compare_vertex(const void* a, const void* b) {
+    const envelope_vertex_t* u = a;
+    const envelope_vertex_t* v = b;
+    if (u->line != v->line) return (u->line > v->line) - (u->line < v->line);
+    return (u->pos > v->pos) - (u->pos < v->pos);
+}
+
+// Vertical (or horizontal) edges: the vertices of every column (row), paired in order.
+static i32 envelope_edges(const envelope_polygon_t* p, bool vertical, envelope_edge_t* edges) {
+    envelope_vertex_t vertices[ENVELOPE_MAX_VERTICES];
+    for (i32 i = 0; i < p->count; ++i) {
+        vertices[i] = vertical ? (envelope_vertex_t){p->x[i], p->y[i]} : (envelope_vertex_t){p->y[i], p->x[i]};
+    }
+    qsort(vertices, p->count, sizeof(envelope_vertex_t), compare_vertex);
+    i32 n = 0;
+    for (i32 i = 0; i + 1 < p->count; i += 2) {
+        if (vertices[i].line != vertices[i + 1].line) continue; // malformed polygon
+        edges[n++] = (envelope_edge_t){vertices[i].line, vertices[i].pos, vertices[i + 1].pos};
+    }
+    return n;
+}
+
+// Whether pixel (x, y) is in the polygon: count the vertical edges on its left.
+static bool envelope_contains(const envelope_edge_t* vertical, i32 count, i64 x, i64 y) {
+    i32 crossings = 0;
+    for (i32 i = 0; i < count; ++i) {
+        if (vertical[i].at <= x && vertical[i].from <= y && y < vertical[i].to) ++crossings;
+    }
+    return crossings % 2 == 1;
+}
+
+// The polygon at `level`: every edge moved as the SDK erodes it.
+static void envelope_erode(const envelope_polygon_t* p, i32 level, envelope_polygon_t* out) {
+    envelope_edge_t vertical[ENVELOPE_MAX_VERTICES], horizontal[ENVELOPE_MAX_VERTICES];
+    i32 nv = envelope_edges(p, true, vertical);
+    i32 nh = envelope_edges(p, false, horizontal);
+    *out = *p;
+    for (i32 e = 0; e < nv; ++e) {
+        // The polygon starts at this edge when it holds the pixel on its right.
+        envelope_edge_t edge = vertical[e];
+        i64 x = envelope_contains(vertical, nv, edge.at, edge.from) ? erode_start(edge.at, level)
+                                                                     : erode_end(edge.at - 1, level) + 1;
+        for (i32 i = 0; i < p->count; ++i) {
+            if (p->x[i] == edge.at && (p->y[i] == edge.from || p->y[i] == edge.to)) out->x[i] = x;
+        }
+    }
+    for (i32 e = 0; e < nh; ++e) {
+        // The polygon starts at this edge when it holds the pixel below it.
+        envelope_edge_t edge = horizontal[e];
+        i64 y = envelope_contains(vertical, nv, edge.from, edge.at) ? erode_start(edge.at, level)
+                                                                     : erode_end(edge.at - 1, level) + 1;
+        for (i32 i = 0; i < p->count; ++i) {
+            if (p->y[i] == edge.at && (p->x[i] == edge.from || p->x[i] == edge.to)) out->y[i] = y;
+        }
+    }
+}
+
+typedef struct envelope_rects_t {
+    i64* values; // x, y, width, height
+    i32 count;
+    i32 capacity;
+} envelope_rects_t;
+
+// Adds a strip, or extends the strip of this polygon (from index `first`) that ends where it starts over the same
+// rows.
+static bool envelope_add_strip(envelope_rects_t* rects, i32 first, i64 x, i64 y, i64 w, i64 h) {
+    for (i32 k = first; k < rects->count; ++k) {
+        i64* r = rects->values + 4 * k;
+        if (r[0] + r[2] == x && r[1] == y && r[3] == h) {
+            r[2] += w;
+            return true;
+        }
+    }
+    if (rects->count == rects->capacity) {
+        i32 capacity = rects->capacity ? 2 * rects->capacity : 16;
+        i64* grown = realloc(rects->values, 4 * (size_t)capacity * sizeof(i64));
+        if (!grown) return false;
+        rects->values = grown;
+        rects->capacity = capacity;
+    }
+    i64* r = rects->values + 4 * rects->count++;
+    r[0] = x; r[1] = y; r[2] = w; r[3] = h;
+    return true;
+}
+
+static i32 unique_sorted(i64* values, i32 count) {
+    qsort(values, count, sizeof(i64), compare_i64);
+    i32 n = 0;
+    for (i32 i = 0; i < count; ++i) {
+        if (n == 0 || values[n - 1] != values[i]) values[n++] = values[i];
+    }
+    return n;
+}
+
+// Vertical strips of the polygon, cut at the x of its vertices.
+static bool envelope_strips(const envelope_polygon_t* p, envelope_rects_t* rects) {
+    envelope_edge_t vertical[ENVELOPE_MAX_VERTICES];
+    i32 nv = envelope_edges(p, true, vertical);
+    i64 xs[ENVELOPE_MAX_VERTICES], ys[2 * ENVELOPE_MAX_VERTICES];
+    for (i32 e = 0; e < nv; ++e) {
+        xs[e] = vertical[e].at;
+        ys[2 * e] = vertical[e].from;
+        ys[2 * e + 1] = vertical[e].to;
+    }
+    i32 nx = unique_sorted(xs, nv);
+    i32 ny = unique_sorted(ys, 2 * nv);
+    i32 first = rects->count;
+    for (i32 i = 0; i + 1 < nx; ++i) {
+        i64 run_start = -1, run_end = -1;
+        for (i32 j = 0; j + 1 < ny; ++j) {
+            if (envelope_contains(vertical, nv, xs[i], ys[j])) {
+                if (run_start < 0 || run_end != ys[j]) {
+                    if (run_start >= 0 && !envelope_add_strip(rects, first, xs[i], run_start, xs[i + 1] - xs[i],
+                                                              run_end - run_start)) return false;
+                    run_start = ys[j];
+                }
+                run_end = ys[j + 1];
+            }
+        }
+        if (run_start >= 0 && !envelope_add_strip(rects, first, xs[i], run_start, xs[i + 1] - xs[i],
+                                                  run_end - run_start)) return false;
+    }
+    return true;
+}
+
+// Level 0 envelopes of the WSI image, in pixels of `libisyntax_read_region()`. Returns their number.
+static i32 envelope_polygons(const isyntax_t* isyntax, envelope_polygon_t** out) {
+    const isyntax_image_t* wsi = isyntax->images + isyntax->wsi_image_index;
+    *out = NULL;
+    if (isyntax->valid_data_envelope_count > 0) {
+        // iSyntax v2: polygons of the header, in pixels of the padded level 0 grid.
+        envelope_polygon_t* polygons = calloc(isyntax->valid_data_envelope_count, sizeof(envelope_polygon_t));
+        if (!polygons) return 0;
+        for (i32 e = 0; e < isyntax->valid_data_envelope_count; ++e) {
+            const isyntax_valid_data_envelope_t* envelope = isyntax->valid_data_envelopes + e;
+            polygons[e].count = MIN(envelope->vertex_count, ENVELOPE_MAX_VERTICES);
+            for (i32 v = 0; v < polygons[e].count; ++v) {
+                polygons[e].x[v] = envelope->vertices[v].x - wsi->level0_padding;
+                polygons[e].y[v] = envelope->vertices[v].y - wsi->level0_padding;
+            }
+        }
+        *out = polygons;
+        return isyntax->valid_data_envelope_count;
+    }
+    // iSyntax v1: the box around every group of connected level 0 tiles present.
+    if (wsi->level_count <= 0 || wsi->levels[0].tiles == NULL) return 0;
+    const isyntax_level_t* level0 = wsi->levels + 0;
+    i64 w = level0->width_in_tiles, h = level0->height_in_tiles, n = w * h;
+    u8* seen = calloc(n, 1);
+    i64* queue = malloc(n * sizeof(i64));
+    envelope_polygon_t* polygons = NULL;
+    i32 count = 0, capacity = 0;
+    for (i64 start = 0; seen && queue && start < n; ++start) {
+        if (!level0->tiles[start].exists || seen[start]) continue;
+        i64 tx0 = start % w, tx1 = tx0, ty0 = start / w, ty1 = ty0;
+        i64 head = 0, tail = 0;
+        seen[start] = 1;
+        queue[tail++] = start;
+        while (head < tail) {
+            i64 index = queue[head++], tx = index % w, ty = index / w;
+            tx0 = MIN(tx0, tx); tx1 = MAX(tx1, tx); ty0 = MIN(ty0, ty); ty1 = MAX(ty1, ty);
+            i64 neighbours[4][2] = {{tx - 1, ty}, {tx + 1, ty}, {tx, ty - 1}, {tx, ty + 1}};
+            for (i32 k = 0; k < 4; ++k) {
+                i64 nx = neighbours[k][0], ny = neighbours[k][1];
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                i64 next = ny * w + nx;
+                if (level0->tiles[next].exists && !seen[next]) {
+                    seen[next] = 1;
+                    queue[tail++] = next;
+                }
+            }
+        }
+        i64 x0 = MAX(tx0 * isyntax->tile_width - wsi->level0_padding, 0);
+        i64 y0 = MAX(ty0 * isyntax->tile_height - wsi->level0_padding, 0);
+        i64 x1 = MIN((tx1 + 1) * isyntax->tile_width - wsi->level0_padding, wsi->width);
+        i64 y1 = MIN((ty1 + 1) * isyntax->tile_height - wsi->level0_padding, wsi->height);
+        if (x1 <= x0 || y1 <= y0) continue;
+        if (count == capacity) {
+            capacity = capacity ? 2 * capacity : 8;
+            envelope_polygon_t* grown = realloc(polygons, capacity * sizeof(envelope_polygon_t));
+            if (!grown) break;
+            polygons = grown;
+        }
+        polygons[count++] = (envelope_polygon_t){{x0, x1, x0, x1}, {y0, y0, y1, y1}, 4};
+    }
+    free(seen);
+    free(queue);
+    *out = polygons;
+    return count;
+}
+
+isyntax_error_t libisyntax_image_get_valid_range(const isyntax_image_t* image, int32_t level,
+                                                 int64_t* start_x, int64_t* start_y, int64_t* end_x, int64_t* end_y) {
+    if (!image || level < 0 || level >= image->level_count || !start_x || !start_y || !end_x || !end_y) {
+        return LIBISYNTAX_INVALID_ARGUMENT;
+    }
+    *start_x = *start_y = erode_start(0, level);
+    *end_x = erode_end(image->width - 1, level);
+    *end_y = erode_end(image->height - 1, level);
+    return LIBISYNTAX_OK;
+}
+
+isyntax_error_t libisyntax_get_data_bounds(const isyntax_t* isyntax, int64_t* x, int64_t* y,
+                                           int64_t* width, int64_t* height) {
+    if (!isyntax || !x || !y || !width || !height) return LIBISYNTAX_INVALID_ARGUMENT;
+    const isyntax_image_t* wsi = isyntax->images + isyntax->wsi_image_index;
+    envelope_polygon_t* polygons;
+    i32 count = envelope_polygons(isyntax, &polygons);
+    i64 x0 = INT64_MAX, y0 = INT64_MAX, x1 = INT64_MIN, y1 = INT64_MIN;
+    for (i32 e = 0; e < count; ++e) {
+        for (i32 v = 0; v < polygons[e].count; ++v) {
+            x0 = MIN(x0, polygons[e].x[v]); x1 = MAX(x1, polygons[e].x[v]);
+            y0 = MIN(y0, polygons[e].y[v]); y1 = MAX(y1, polygons[e].y[v]);
+        }
+    }
+    free(polygons);
+    x0 = MAX(x0, 0); y0 = MAX(y0, 0);
+    x1 = MIN(x1, (i64)wsi->width); y1 = MIN(y1, (i64)wsi->height);
+    if (x1 <= x0 || y1 <= y0) {
+        x0 = y0 = 0;
+        x1 = wsi->width;
+        y1 = wsi->height;
+    }
+    *x = x0; *y = y0; *width = x1 - x0; *height = y1 - y0;
+    return LIBISYNTAX_OK;
+}
+
+isyntax_error_t libisyntax_get_data_envelopes(const isyntax_t* isyntax, int32_t level,
+                                              int64_t* rects, int32_t capacity, int32_t* count) {
+    if (!isyntax || !count || capacity < 0 || (capacity > 0 && !rects)) return LIBISYNTAX_INVALID_ARGUMENT;
+    const isyntax_image_t* wsi = isyntax->images + isyntax->wsi_image_index;
+    if (level < 0 || level >= wsi->level_count) return LIBISYNTAX_INVALID_ARGUMENT;
+    envelope_polygon_t* polygons;
+    i32 n = envelope_polygons(isyntax, &polygons);
+    envelope_rects_t regions = {0};
+    bool ok = true;
+    for (i32 e = 0; ok && e < n; ++e) {
+        envelope_polygon_t eroded;
+        envelope_erode(polygons + e, level, &eroded);
+        ok = envelope_strips(&eroded, &regions);
+    }
+    free(polygons);
+    if (ok) {
+        *count = regions.count;
+        for (i32 k = 0; k < regions.count && k < capacity; ++k) {
+            for (i32 c = 0; c < 4; ++c) rects[4 * k + c] = regions.values[4 * k + c];
+        }
+    }
+    free(regions.values);
+    return ok ? LIBISYNTAX_OK : LIBISYNTAX_FATAL;
+}
+
 isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t cache_size,
                                         isyntax_cache_t** out_isyntax_cache)
 {
@@ -372,8 +668,6 @@ isyntax_error_t libisyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* isynta
     return LIBISYNTAX_OK;
 }
 
-#define PER_LEVEL_PADDING 3
-
 isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyntax_cache, int32_t level,
                                        int64_t x, int64_t y, int64_t width, int64_t height, uint32_t* pixels_buffer,
                                        int32_t pixel_format) {
@@ -386,9 +680,12 @@ isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyn
     ASSERT(level < isyntax->images[0].level_count);
     isyntax_level_t* current_level = &isyntax->images[0].levels[level];
 
-    // TODO(pvalkema): check if this still needs adjustment
-    int32_t num_levels = isyntax->images[0].level_count;
-    int32_t offset = ((PER_LEVEL_PADDING << num_levels) - PER_LEVEL_PADDING) >> level;
+    // The pyramid is padded by `level0_padding` pixels on each side of level 0, and the tile grid of each level starts
+    // `origin_offset_in_pixels` (in level 0 pixels) into that padding. Rounding down to whole pixels of the level
+    // gives the same pixels as the Philips SDK at every level.
+    int32_t level0_padding = isyntax->images[0].level0_padding;
+    int32_t origin_offset = (level == 0) ? 0 : current_level->origin_offset_in_pixels;
+    int32_t offset = (level0_padding - origin_offset) >> level;
 
     x += offset;
     y += offset;

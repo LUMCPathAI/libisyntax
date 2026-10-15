@@ -142,6 +142,15 @@ if get_option('tests')
     ],
   )
 
+  # Valid range, bounds and envelopes against the values of the Philips SDK.
+  valid_data_test = executable(
+    'valid_data_test',
+    'test/valid_data_test.c',
+    dependencies : [libisyntax_dep],
+    include_directories : [isyntax_includes],
+  )
+  test('valid_data_matches_philips_sdk', valid_data_test, args : [testslide])
+
   if not is_macos
     # TODO: fix this test on macOS: fatal error: 'threads.h' file not found
     thread_test = executable(

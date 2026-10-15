@@ -1660,20 +1660,23 @@ static u32 wavelet_coefficient_to_color_value(icoeff_t coefficient) {
 }
 #endif
 
+// The halving steps use an arithmetic shift (floor division), not `/2` (truncation toward zero): this matches the
+// SSE2/NEON paths below (`_mm_srai_epi16` / `vshrq_n_s16`) and is bit-exact with the Philips SDK. Results are clamped
+// to 0..255 on both ends, as the SIMD paths do with their saturating packs.
 static rgba_t ycocg_to_rgb(icoeff_t Y, icoeff_t Co, icoeff_t Cg) {
-    icoeff_t tmp = Y - Cg/2;
-    icoeff_t G = tmp + Cg;
-    icoeff_t B = tmp - Co/2;
-    icoeff_t R = B + Co;
-    return (rgba_t){{{ATMOST(255, R), ATMOST(255, G), ATMOST(255, B), 255}}};
+    i32 tmp = Y - (Cg >> 1);
+    i32 G = tmp + Cg;
+    i32 B = tmp - (Co >> 1);
+    i32 R = B + Co;
+    return (rgba_t){{{CLAMP(R, 0, 255), CLAMP(G, 0, 255), CLAMP(B, 0, 255), 255}}};
 }
 
 static rgba_t ycocg_to_bgr(icoeff_t Y, icoeff_t Co, icoeff_t Cg) {
-    icoeff_t tmp = Y - Cg/2;
-    icoeff_t G = tmp + Cg;
-    icoeff_t B = tmp - Co/2;
-    icoeff_t R = B + Co;
-    return (rgba_t){{{ATMOST(255, B), ATMOST(255, G), ATMOST(255, R), 255}}};
+    i32 tmp = Y - (Cg >> 1);
+    i32 G = tmp + Cg;
+    i32 B = tmp - (Co >> 1);
+    i32 R = B + Co;
+    return (rgba_t){{{CLAMP(B, 0, 255), CLAMP(G, 0, 255), CLAMP(R, 0, 255), 255}}};
 }
 
 static void convert_ycocg_to_bgra_block(icoeff_t* Y, icoeff_t* Co, icoeff_t* Cg, i32 width, i32 height, i32 stride, u32* out_bgra) {
