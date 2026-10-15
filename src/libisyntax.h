@@ -98,15 +98,23 @@ double                 libisyntax_level_get_downsample_factor(const isyntax_leve
 double                 libisyntax_level_get_origin_offset_in_pixels(const isyntax_level_t* level);
 
 //== Cache API ==
+// The cache keeps the decoded coefficients of recently read tiles. Several isyntax objects can share one cache, so
+// that their coefficients fit in one memory budget: inject it into each, and flush the tiles of an isyntax before
+// closing it. Reads of the injected isyntax objects can run in parallel from any thread.
+// 'cache_size' is the number of tiles the cache keeps.
 isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t cache_size,
                                         isyntax_cache_t** out_isyntax_cache);
+// When 'capacity_bytes' is not 0, the cache also evicts tiles until their coefficients fit in that many bytes.
+isyntax_error_t libisyntax_cache_set_capacity_bytes(isyntax_cache_t* isyntax_cache, int64_t capacity_bytes);
+// Bytes of the coefficients the cache holds.
+int64_t         libisyntax_cache_get_used_bytes(isyntax_cache_t* isyntax_cache);
 // Note: returns LIBISYNTAX_INVALID_ARGUMENT  if isyntax_to_inject was not initialized with is_init_allocators = 0.
 // TODO(avirodov): this function will fail if the isyntax object has different block size than the first isyntax injected.
 //  Block size variation was not observed in practice, and a proper fix may include supporting multiple block sizes
 //  within isyntax_cache_t implementation.
 isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_t* isyntax);
-// Flushes the cache. If 'isyntax_or_null' is not NULL, will attempt to flush only the tiles of that isyntax.
-// TODO(avirodov): currently flushes all cache, isyntax_or_null is unused.
+// Flushes the cache, freeing the coefficients. If 'isyntax_or_null' is not NULL, flushes only the tiles of that
+// isyntax: call it before closing an isyntax that shares the cache, once no read of it runs.
 void            libisyntax_cache_flush(isyntax_cache_t* isyntax_cache, isyntax_t* isyntax_or_null);
 void            libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache);
 

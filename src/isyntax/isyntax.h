@@ -267,6 +267,11 @@ typedef struct isyntax_tile_t {
     bool cache_marked;
     struct isyntax_tile_t* cache_next;
     struct isyntax_tile_t* cache_prev;
+    // Guarded by the cache mutex. Reads using the tile pin it: a pinned tile is out of the cache list, so it is
+    // never evicted.
+    i32 cache_pin_count;
+    bool is_coeff_loading; // A read is decoding its codeblocks.
+    bool is_idwt_running; // A read is computing the LL coefficients of its children.
 
     // Note(avirodov): this is needed for isyntax_reader. It is very convenient to be able to compute neighbors
     // from the tile itself, although at the cost of additional memory (3 ints) per tile.
@@ -431,6 +436,12 @@ void isyntax_destroy(isyntax_t* isyntax);
 void isyntax_idwt(icoeff_t* idwt, i32 quadrant_width, i32 quadrant_height, bool output_steps_as_png, const char* png_name);
 void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y, block_allocator_t* ll_coeff_block_allocator,
                        u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format);
+// isyntax_load_tile() for reads running in parallel (isyntax_tile_read()): child tiles keep the LL coefficients they
+// already have, as other reads may use them, and no field shared by every tile is written. The caller sets has_ll of
+// the children.
+void isyntax_load_tile_concurrent(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y,
+                                  block_allocator_t* ll_coeff_block_allocator,
+                                  u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format);
 u32 isyntax_get_adjacent_tiles_mask(isyntax_level_t* level, i32 tile_x, i32 tile_y);
 u32 isyntax_get_adjacent_tiles_mask_only_existing(isyntax_level_t* level, i32 tile_x, i32 tile_y);
 u32 isyntax_idwt_tile_for_color_channel(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y, i32 color, icoeff_t* dest_buffer);

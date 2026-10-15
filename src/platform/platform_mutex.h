@@ -60,6 +60,20 @@ void platform_mutex_destroy(platform_mutex_t* mutex);
 void platform_mutex_lock(platform_mutex_t* mutex);
 void platform_mutex_unlock(platform_mutex_t* mutex);
 
+typedef struct platform_cond_t {
+#ifdef _WIN32
+	CONDITION_VARIABLE cond;
+#else
+	pthread_cond_t cond;
+#endif
+} platform_cond_t;
+
+void platform_cond_init(platform_cond_t* cond);
+void platform_cond_destroy(platform_cond_t* cond);
+// Releases the mutex while waiting, and holds it again on return. May wake up spuriously: check the condition again.
+void platform_cond_wait(platform_cond_t* cond, platform_mutex_t* mutex);
+void platform_cond_broadcast(platform_cond_t* cond);
+
 #ifdef __cplusplus
 }
 #endif

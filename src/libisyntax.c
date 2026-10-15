@@ -291,6 +291,7 @@ isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t 
     tile_list_init(&cache_ptr->cache_list, debug_name_or_null);
     cache_ptr->target_cache_size = cache_size;
     platform_mutex_init(&cache_ptr->mutex);
+    platform_cond_init(&cache_ptr->tile_ready);
 
     // Note: rest of initialization is deferred to the first injection, as that is where we will know the block size.
 
@@ -304,22 +305,23 @@ isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_
         return LIBISYNTAX_INVALID_ARGUMENT;
     }
 
-    isyntax_cache->allocator_block_width = isyntax->block_width;
-    isyntax_cache->allocator_block_height = isyntax->block_height;
-    size_t ll_coeff_block_size = isyntax->block_width * isyntax->block_height * sizeof(icoeff_t);
-    size_t block_allocator_maximum_capacity_in_blocks = GIGABYTES(32) / ll_coeff_block_size;
-    size_t ll_coeff_block_allocator_capacity_in_blocks = block_allocator_maximum_capacity_in_blocks / 4;
-    size_t h_coeff_block_size = ll_coeff_block_size * 3;
-    size_t h_coeff_block_allocator_capacity_in_blocks = ll_coeff_block_allocator_capacity_in_blocks * 3;
-    isyntax_cache->ll_coeff_block_allocator = malloc(sizeof(block_allocator_t));
-    isyntax_cache->h_coeff_block_allocator = malloc(sizeof(block_allocator_t));
-    block_allocator_init(isyntax_cache->ll_coeff_block_allocator, ll_coeff_block_size, ll_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
-    block_allocator_init(isyntax_cache->h_coeff_block_allocator, h_coeff_block_size, h_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
-    isyntax_cache->is_block_allocator_owned = true;
-
-    if (isyntax_cache->allocator_block_width != isyntax->block_width ||
-            isyntax_cache->allocator_block_height != isyntax->block_height) {
-        return LIBISYNTAX_FATAL; // Not implemented, see todo in libisyntax.h.
+    // The allocators are made for the first isyntax; the next ones share them.
+    if (!isyntax_cache->is_block_allocator_owned) {
+        isyntax_cache->allocator_block_width = isyntax->block_width;
+        isyntax_cache->allocator_block_height = isyntax->block_height;
+        size_t ll_coeff_block_size = isyntax->block_width * isyntax->block_height * sizeof(icoeff_t);
+        size_t block_allocator_maximum_capacity_in_blocks = GIGABYTES(32) / ll_coeff_block_size;
+        size_t ll_coeff_block_allocator_capacity_in_blocks = block_allocator_maximum_capacity_in_blocks / 4;
+        size_t h_coeff_block_size = ll_coeff_block_size * 3;
+        size_t h_coeff_block_allocator_capacity_in_blocks = ll_coeff_block_allocator_capacity_in_blocks * 3;
+        isyntax_cache->ll_coeff_block_allocator = malloc(sizeof(block_allocator_t));
+        isyntax_cache->h_coeff_block_allocator = malloc(sizeof(block_allocator_t));
+        block_allocator_init(isyntax_cache->ll_coeff_block_allocator, ll_coeff_block_size, ll_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
+        block_allocator_init(isyntax_cache->h_coeff_block_allocator, h_coeff_block_size, h_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
+        isyntax_cache->is_block_allocator_owned = true;
+    } else if (isyntax_cache->allocator_block_width != isyntax->block_width ||
+               isyntax_cache->allocator_block_height != isyntax->block_height) {
+        return LIBISYNTAX_INVALID_ARGUMENT; // Not implemented, see todo in libisyntax.h.
     }
 
     isyntax->ll_coeff_block_allocator = isyntax_cache->ll_coeff_block_allocator;
@@ -330,16 +332,37 @@ isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_
 
 
 void libisyntax_cache_flush(isyntax_cache_t* isyntax_cache, isyntax_t* isyntax_or_null) {
-    // Flusing per-isyntax is not yet implemented.
-    (void)isyntax_or_null;
-
     platform_mutex_lock(&isyntax_cache->mutex);
 
-    while (isyntax_cache->cache_list.tail) {
-        tile_list_remove(&isyntax_cache->cache_list, isyntax_cache->cache_list.tail);
+    if (isyntax_or_null == NULL) {
+        while (isyntax_cache->cache_list.tail) {
+            isyntax_cache_drop_tile(isyntax_cache, isyntax_cache->cache_list.tail);
+        }
+    } else {
+        isyntax_image_t* wsi = &isyntax_or_null->images[isyntax_or_null->wsi_image_index];
+        for (i32 level = 0; level < wsi->level_count; ++level) {
+            isyntax_level_t* l = &wsi->levels[level];
+            for (u64 i = 0; l->tiles && i < l->tile_count; ++i) {
+                isyntax_cache_drop_tile(isyntax_cache, &l->tiles[i]);
+            }
+        }
     }
 
     platform_mutex_unlock(&isyntax_cache->mutex);
+}
+
+isyntax_error_t libisyntax_cache_set_capacity_bytes(isyntax_cache_t* isyntax_cache, int64_t capacity_bytes) {
+    if (capacity_bytes < 0) {
+        return LIBISYNTAX_INVALID_ARGUMENT;
+    }
+    platform_mutex_lock(&isyntax_cache->mutex);
+    isyntax_cache->capacity_bytes = capacity_bytes;
+    platform_mutex_unlock(&isyntax_cache->mutex);
+    return LIBISYNTAX_OK;
+}
+
+int64_t libisyntax_cache_get_used_bytes(isyntax_cache_t* isyntax_cache) {
+    return isyntax_cache_used_bytes(isyntax_cache);
 }
 
 void libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache) {
@@ -352,6 +375,7 @@ void libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache) {
         }
     }
 
+    platform_cond_destroy(&isyntax_cache->tile_ready);
     platform_mutex_destroy(&isyntax_cache->mutex);
     free(isyntax_cache);
 }

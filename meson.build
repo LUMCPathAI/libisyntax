@@ -151,5 +151,13 @@ if get_option('tests')
       include_directories : [isyntax_includes],
     )
     test('smoke_thread_test', thread_test)
+
+    concurrent_read_test = executable(
+      'concurrent_read_test',
+      'test/concurrent_read_test.c',
+      dependencies : [libisyntax_dep],
+      include_directories : [isyntax_includes],
+    )
+    test('concurrent_reads_match_single_thread', concurrent_read_test, args : [testslide], timeout : 300)
   endif
 endif

@@ -139,3 +139,16 @@ void block_free(block_allocator_t* allocator, void* ptr_to_free) {
 	}
 
 }
+
+size_t block_allocator_used_bytes(block_allocator_t* allocator) {
+	if (!allocator || !allocator->is_valid) return 0;
+	platform_mutex_lock(&allocator->lock);
+	size_t blocks = 0;
+	for (i32 i = 0; i < allocator->used_chunks; ++i) {
+		blocks += allocator->chunks[i].used_blocks;
+	}
+	blocks -= allocator->free_list_length;
+	size_t result = blocks * allocator->block_size;
+	platform_mutex_unlock(&allocator->lock);
+	return result;
+}

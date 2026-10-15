@@ -2250,9 +2250,9 @@ u32 isyntax_idwt_tile_for_color_channel(isyntax_t* isyntax, isyntax_image_t* wsi
 	return invalid_edges;
 }
 
-void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y,
-                       block_allocator_t* ll_coeff_block_allocator,
-                       u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format) {
+static void load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y,
+                      block_allocator_t* ll_coeff_block_allocator,
+                      u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format, bool concurrent) {
 	// printf("@@@ isyntax_load_tile scale=%d tile_x=%d tile_y=%d\n", scale, tile_x, tile_y);
 	isyntax_level_t* level = wsi->levels + scale;
 	ASSERT(tile_x >= 0 && tile_x < level->width_in_tiles);
@@ -2308,31 +2308,30 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 		isyntax_tile_t* child_bottom_left = child_top_left + next_level->width_in_tiles;
 		isyntax_tile_t* child_bottom_right = child_bottom_left + 1;
 
-		// TODO(avirodov): instead of releasing here, skip copy if still allocated.
-		if (child_top_left->color_channels[color].coeff_ll) {
-			block_free(ll_coeff_block_allocator, child_top_left->color_channels[color].coeff_ll);
-		}
-		if (child_top_right->color_channels[color].coeff_ll) {
-			block_free(ll_coeff_block_allocator, child_top_right->color_channels[color].coeff_ll);
-		}
-		if (child_bottom_left->color_channels[color].coeff_ll) {
-			block_free(ll_coeff_block_allocator, child_bottom_left->color_channels[color].coeff_ll);
-		}
-		if (child_bottom_right->color_channels[color].coeff_ll) {
-			block_free(ll_coeff_block_allocator, child_bottom_right->color_channels[color].coeff_ll);
+		// Concurrent reads may be reading the LL blocks children already have: keep those, they hold the same
+		// coefficients.
+		isyntax_tile_t* children[4] = {child_top_left, child_top_right, child_bottom_left, child_bottom_right};
+		bool keep[4] = {0};
+		for (i32 i = 0; i < 4; ++i) {
+			icoeff_t** coeff_ll = &children[i]->color_channels[color].coeff_ll;
+			keep[i] = concurrent && *coeff_ll != NULL;
+			if (!keep[i] && *coeff_ll) {
+				block_free(ll_coeff_block_allocator, *coeff_ll);
+			}
 		}
 
 		// NOTE: malloc() and free() can become a bottleneck, they don't scale well especially across many threads.
 		// We use a custom block allocator to address this.
 		i64 start_malloc = get_clock();
-		child_top_left->color_channels[color].coeff_ll = (icoeff_t*)block_alloc(ll_coeff_block_allocator);
-		child_top_right->color_channels[color].coeff_ll = (icoeff_t*)block_alloc(ll_coeff_block_allocator);
-		child_bottom_left->color_channels[color].coeff_ll = (icoeff_t*)block_alloc(ll_coeff_block_allocator);
-		child_bottom_right->color_channels[color].coeff_ll = (icoeff_t*)block_alloc(ll_coeff_block_allocator);
+		for (i32 i = 0; i < 4; ++i) {
+			if (!keep[i]) {
+				children[i]->color_channels[color].coeff_ll = (icoeff_t*)block_alloc(ll_coeff_block_allocator);
+			}
+		}
 		elapsed_malloc += get_seconds_elapsed(start_malloc, get_clock());
 		i32 dest_stride = block_width;
 		// Blit top left child LL block
-		{
+		if (!keep[0]) {
 			icoeff_t* dest = child_top_left->color_channels[color].coeff_ll;
 			icoeff_t* source = idwt + (first_valid_pixel * idwt_stride) + first_valid_pixel;
 			for (i32 y = 0; y < block_height; ++y) {
@@ -2342,7 +2341,7 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 			}
 		}
 		// Blit top right child LL block
-		{
+		if (!keep[1]) {
 			icoeff_t* dest = child_top_right->color_channels[color].coeff_ll;
 			icoeff_t* source = idwt + (first_valid_pixel * idwt_stride) + first_valid_pixel + block_width;
 			for (i32 y = 0; y < block_height; ++y) {
@@ -2352,7 +2351,7 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 			}
 		}
 		// Blit bottom left child LL block
-		{
+		if (!keep[2]) {
 			icoeff_t* dest = child_bottom_left->color_channels[color].coeff_ll;
 			icoeff_t* source = idwt + ((first_valid_pixel + block_height) * idwt_stride) + first_valid_pixel;
 			for (i32 y = 0; y < block_height; ++y) {
@@ -2362,7 +2361,7 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 			}
 		}
 		// Blit bottom right child LL block
-		{
+		if (!keep[3]) {
 			icoeff_t* dest = child_bottom_right->color_channels[color].coeff_ll;
 			icoeff_t* source = idwt + ((first_valid_pixel + block_height) * idwt_stride) + first_valid_pixel + block_width;
 			for (i32 y = 0; y < block_height; ++y) {
@@ -2373,11 +2372,14 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 		}
 
 		// After the last color channel, we can report that the children now have their LL blocks available.
+		// Concurrent reads report it under their lock.
 		if (color == 2) {
-			child_top_left->has_ll = true;
-			child_top_right->has_ll = true;
-			child_bottom_left->has_ll = true;
-			child_bottom_right->has_ll = true;
+			if (!concurrent) {
+				child_top_left->has_ll = true;
+				child_top_right->has_ll = true;
+				child_bottom_left->has_ll = true;
+				child_bottom_right->has_ll = true;
+			}
 
 			if (invalid_edges != 0) {
 				console_print_error("load: scale=%d x=%d y=%d  idwt time =%g  invalid edges=%x\n", scale, tile_x, tile_y, elapsed_idwt, invalid_edges);
@@ -2388,7 +2390,9 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 		}
 	}
 
-	tile->is_loaded = true; // Meaning: it is now safe to start loading 'child' tiles of the next level
+	if (!concurrent) {
+		tile->is_loaded = true; // Meaning: it is now safe to start loading 'child' tiles of the next level
+	}
 	if (out_buffer_or_null == NULL) {
 		release_temp_memory(&temp_memory); // free Y, Co and Cg
 		return;
@@ -2419,7 +2423,9 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
             ASSERT(!"unknown pixel format!");
             break;
     }
-	isyntax->total_rgb_transform_time += get_seconds_elapsed(start, get_clock());
+	if (!concurrent) {
+		isyntax->total_rgb_transform_time += get_seconds_elapsed(start, get_clock());
+	}
 
 	//		float elapsed_rgb = get_seconds_elapsed(start, get_clock());
 	//	console_print_verbose("load: scale=%d x=%d y=%d  idwt time =%g  rgb transform time=%g  malloc time=%g\n", scale, tile_x, tile_y, elapsed_idwt, elapsed_rgb, elapsed_malloc);
@@ -2429,6 +2435,20 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 //	}
 
 	release_temp_memory(&temp_memory); // free Y, Co and Cg
+}
+
+void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y,
+                       block_allocator_t* ll_coeff_block_allocator,
+                       u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format) {
+	load_tile(isyntax, wsi, scale, tile_x, tile_y, ll_coeff_block_allocator, out_buffer_or_null, pixel_format,
+	          /*concurrent=*/false);
+}
+
+void isyntax_load_tile_concurrent(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y,
+                                  block_allocator_t* ll_coeff_block_allocator,
+                                  u32* out_buffer_or_null, enum isyntax_pixel_format_t pixel_format) {
+	load_tile(isyntax, wsi, scale, tile_x, tile_y, ll_coeff_block_allocator, out_buffer_or_null, pixel_format,
+	          /*concurrent=*/true);
 }
 
 

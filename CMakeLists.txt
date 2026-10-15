@@ -167,6 +167,11 @@ if(BUILD_TESTING)
         target_link_libraries(thread_test isyntax)
         add_test(NAME smoke_thread_test
                 COMMAND thread_test)
+
+        add_executable(concurrent_read_test test/concurrent_read_test.c)
+        target_link_libraries(concurrent_read_test isyntax)
+        add_test(NAME concurrent_reads_match_single_thread
+                COMMAND concurrent_read_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax)
     endif()
 
 
